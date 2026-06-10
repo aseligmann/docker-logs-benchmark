@@ -98,9 +98,14 @@ def read_sample():
 def log_files(cid):
     base = "/proc/%d/root/var/lib/docker/containers/%s" % (pid(), cid)
     out = []
-    for name in sorted(os.listdir(base)):
-        if "-json.log" in name:
-            out.append({"name": name, "size": os.path.getsize(os.path.join(base, name))})
+    for sub in ("", "local-logs"):
+        d = os.path.join(base, sub) if sub else base
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if "-json.log" in name or name.startswith("container.log"):
+                rel = "%s/%s" % (sub, name) if sub else name
+                out.append({"name": rel, "size": os.path.getsize(os.path.join(d, name))})
     return out
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -370,18 +375,33 @@ def container_id(name: str) -> str:
     return docker_out("inspect", "-f", "{{.Id}}", name)
 
 
+def config_log_opts(config: str, args) -> list[str]:
+    # The daemon may default to rotation (OrbStack: max-size=20m,max-file=5),
+    # so "single" must explicitly request one big file.
+    if config == "single":
+        return rotate_opts(args.single_max_size, 1)
+    if config == "rotated":
+        return rotate_opts(args.rotate_max_size, args.rotate_max_file)
+    if config == "local":
+        return [
+            "--log-driver", "local",
+            "--log-opt", f"max-size={args.local_max_size}",
+            "--log-opt", f"max-file={args.local_max_file}",
+            "--log-opt", "compress=true",
+        ]
+    raise SystemExit(f"unknown config {config!r} (expected single, rotated, local)")
+
+
 def do_setup(args, sampler: Sampler) -> dict:
     state_path = state_file(args)
     suffix = "-smoke" if args.smoke_variant else ""
     configs = {}
+    if state_path.exists():
+        prev = json.loads(state_path.read_text())
+        if prev.get("lines") == args.lines and prev.get("line_bytes") == args.line_bytes:
+            configs = prev.get("configs", {})
     for config in args.configs:
-        # The daemon may default to rotation (OrbStack: max-size=20m,max-file=5),
-        # so "single" must explicitly request one big file.
-        log_opts = (
-            rotate_opts(args.rotate_max_size, args.rotate_max_file)
-            if config == "rotated"
-            else rotate_opts(args.single_max_size, 1)
-        )
+        log_opts = config_log_opts(config, args)
         name = make_generator(config, suffix, args.lines, args.line_bytes, log_opts)
         cutoffs = scan_cutoffs(name, args.lines, args.percentiles)
         files = sampler.log_files(container_id(name))
@@ -408,8 +428,6 @@ def do_setup(args, sampler: Sampler) -> dict:
         "created": utc_stamp(),
         "lines": args.lines,
         "line_bytes": args.line_bytes,
-        "rotate_max_size": args.rotate_max_size,
-        "rotate_max_file": args.rotate_max_file,
         "configs": configs,
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -817,6 +835,16 @@ def do_smoke(args) -> None:
 # CLI
 
 
+def add_config_opts(
+    p: argparse.ArgumentParser, rotate_max_size: str = "20m", rotate_max_file: int = 16
+) -> None:
+    p.add_argument("--rotate-max-size", default=rotate_max_size)
+    p.add_argument("--rotate-max-file", type=int, default=rotate_max_file)
+    p.add_argument("--single-max-size", default="1g")
+    p.add_argument("--local-max-size", default="50m")
+    p.add_argument("--local-max-file", type=int, default=10)
+
+
 def add_common(p: argparse.ArgumentParser, lines: int, out: str) -> None:
     p.add_argument("--lines", type=int, default=lines)
     p.add_argument("--line-bytes", type=int, default=200)
@@ -832,15 +860,11 @@ def main() -> None:
 
     p_setup = sub.add_parser("setup", help="generate log containers and cutoff table")
     add_common(p_setup, 1_000_000, "results")
-    p_setup.add_argument("--rotate-max-size", default="20m")
-    p_setup.add_argument("--rotate-max-file", type=int, default=16)
-    p_setup.add_argument("--single-max-size", default="1g")
+    add_config_opts(p_setup)
 
     p_run = sub.add_parser("run", help="run the benchmark matrix")
     add_common(p_run, 1_000_000, "results")
-    p_run.add_argument("--rotate-max-size", default="20m")
-    p_run.add_argument("--rotate-max-file", type=int, default=16)
-    p_run.add_argument("--single-max-size", default="1g")
+    add_config_opts(p_run)
     p_run.add_argument("--reps", type=int, default=5)
     p_run.add_argument("--cache", choices=["warm", "cold", "both"], default="both")
     p_run.add_argument("--force", action="store_true")
@@ -855,9 +879,7 @@ def main() -> None:
     p_smoke = sub.add_parser("smoke", help="end-to-end test at small scale")
     add_common(p_smoke, 20_000, "results/smoke")
     p_smoke.set_defaults(percentiles=[50, 99])
-    p_smoke.add_argument("--rotate-max-size", default="1m")
-    p_smoke.add_argument("--rotate-max-file", type=int, default=6)
-    p_smoke.add_argument("--single-max-size", default="1g")
+    add_config_opts(p_smoke, rotate_max_size="1m", rotate_max_file=6)
 
     args = ap.parse_args()
     args.smoke_variant = args.cmd == "smoke"
