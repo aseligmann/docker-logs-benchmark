@@ -1,5 +1,9 @@
 # docker-log-benchmark
 
+> [!IMPORTANT]
+> This benchmark is entirely vibecoded, so verify results before taking as gospel.
+> (Claude Code, Fable 5)
+
 Measures the daemon-side cost of `docker logs` filtering with the json-file
 and local logging drivers, comparing four scenarios on the same container
 log:
