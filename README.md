@@ -78,6 +78,50 @@ Per-run metrics (deltas on the dockerd process):
 An idle-noise baseline (sample pairs with no docker activity) is recorded at
 session start and reported as the noise floor.
 
+## Overview: comparison and takeaways
+
+Four configurations were tested (details and per-scenario tables in
+Results below). The json-file numbers group cleanly because layout never
+mattered: single file, 20m x 16, and 50m x 10 uncompressed were identical.
+
+| 1M lines x 200 B | json-file, no compression (A, D) | json-file + compress (C) | local + compress (B) |
+|---|---|---|---|
+| disk footprint | 270 MB | 26 MB | 33 MB |
+| full read: dockerd CPU | 3.2 s | 3.4 s | 2.1 s |
+| since@p99: bytes read / CPU | 270 MB / 1.7 s | 20 MB / 0.14 s | 28 MB / 0.10 s |
+| tail+since@p99: bytes read / CPU | 5.9 MB / 0.04 s | 5.9 MB / 0.04 s | 2.6 MB / 0.03 s |
+| reads can cause disk writes | no | yes (decompression) | yes (decompression) |
+| `--tail` read amplification | 2x | 2x | 1x |
+| log files readable by external tools | yes (json text) | archives gzipped | no (binary frames) |
+
+Takeaways:
+
+- **Pair `--since T` with a generous `--tail N` everywhere.** It was the
+  cheapest way to ask for "logs since T" on every configuration: 40-45x
+  cheaper than plain `--since` on uncompressed json-file, and still 3-10x
+  cheaper on the compressed configs. N just has to exceed the number of
+  lines since T; oversizing N costs nothing as long as it stays well below
+  the total line count.
+- **`compress=true` is what fixes plain `--since`, not the driver.**
+  Compressed rotation stamps each archive with its last-entry timestamp,
+  letting `--since` skip whole archives. json-file + compress behaves like
+  the local driver here; json-file without compress always scans
+  everything, regardless of rotation layout.
+- **Compression trades read-side writes for that pruning.** Any query
+  reaching into archives decompresses them to temp files first - 100-250 MB
+  of write I/O and transient disk per invocation in this test, with no
+  caching between invocations. Keep routine queries inside the active file
+  (recent T plus `--tail`) and the cost never materializes.
+- **The local driver is the most efficient reader** (~35% less CPU per
+  line, no `--tail` double-read) **but its files are binary** - anything
+  that tails or parses the log files directly instead of going through
+  `docker logs` stops working.
+- **Retention is the silent failure mode on every configuration.** Rotation
+  deletes the oldest file/archive without any error surfacing in
+  `docker logs`, and OrbStack rotates by default (`20m x 5`). Compression
+  stretches the same disk budget ~10x on this payload, which is the main
+  defense besides sizing `max-size x max-file` deliberately.
+
 ## Results
 
 All measurements 2026-06-10 on an Apple Silicon Mac, Docker 28.5.2 under
