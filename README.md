@@ -49,6 +49,8 @@ The matrix per config: `full`, plus `since` / `tail` / `tail_since` at each
   above the ~270 MB on-disk footprint of the 200 MB stream so no lines
   rotate away; the setup scan aborts if line 1 is missing
 - `local`: the `local` driver with `max-size=50m max-file=10 compress=true`
+- `json-compressed`: json-file, `max-size=50m max-file=10 compress=true`
+- `json-uncompressed`: json-file, `max-size=50m max-file=10 compress=false`
 
 Results land in `results/session-<ts>.json` (raw samples) and a rendered
 `.md` summary with median (min-max) per cell.
@@ -229,6 +231,89 @@ uv run bench.py run --cache cold --configs local
   lines are gone. With compression the same `max-size x max-file` budget
   retains far more history (here ~7x), which shrinks that risk for equal
   disk spend.
+
+### Configuration C: json-file driver with compression
+
+- driver `json-file` with `max-size=50m`, `max-file=10`, `compress=true`
+  (daemon.json equivalent: `"log-driver": "json-file", "log-opts":
+  {"max-size": "50m", "max-file": "10", "compress": "true"}`)
+- ~270 MB of json data stored as 5 gzip archives (~1.3 MB each, 50 MB
+  uncompressed) plus a ~20 MB uncompressed active file = **26 MB on disk**
+
+To replicate:
+
+```sh
+uv run bench.py run --cache warm --configs json-compressed
+uv run bench.py run --cache cold --configs json-compressed
+```
+
+| scenario | lines out | rchar_MB | cold read_MB | cold write_MB | cpu_s | wall_s |
+|---|---|---|---|---|---|---|
+| full | 1,000,000 | 276.2 | 26.3 | 250.0 | 3.43 | 2.25 |
+| since@p50 | 500,000 | 173.7 | 23.9 | 150.0 | 1.89 | 1.29 |
+| since@p90 | 100,000 | 71.2 | 21.4 | 50.0 | 0.62 | 0.48 |
+| since@p99 | 10,000 | 19.9 | 20.1 | 0.0 | 0.14 | 0.13 |
+| tail@p50 (N=550k) | 550,000 | 300.7 | 23.8 | 150.0 | 1.96 | 1.30 |
+| tail@p90 (N=110k) | 110,001 | 60.6 | 21.3 | 50.0 | 0.41 | 0.29 |
+| tail@p99 (N=11k) | 11,000 | 5.9 | 3.1 | 0.0 | 0.04 | 0.05 |
+| tail_since@p50 | 500,000 | 300.7 | 23.8 | 150.0 | 1.97 | 1.40 |
+| tail_since@p90 | 100,000 | 60.6 | 21.3 | 50.0 | 0.40 | 0.29 |
+| tail_since@p99 | 10,000 | 5.9 | 3.1 | 0.0 | 0.05 | 0.04 |
+
+#### Findings (json-file + compress)
+
+- **Compression gives json-file the same `--since` archive pruning as the
+  local driver.** The rotation/compression machinery is shared: the gzip
+  header carries the archive's last-entry timestamp, and `--since` skips
+  archives entirely older than T. since@p99 read only the ~20 MB active
+  file (zero decompression); since@p90 decompressed exactly 1 of 5
+  archives; since@p50 exactly 3. With `compress=false` the same command
+  reads all 270 MB (Configuration D below).
+- **The within-file behavior stays json-file-shaped.** `--tail` still
+  double-reads its window (tail@p90: 60.6 MB rchar for ~30 MB of output,
+  vs 1x on the local driver), and per-line decode CPU matches plain
+  json-file for the bytes actually read.
+- **Same decompression-to-temp-file cost as the local driver.** Any read
+  touching archives writes their uncompressed size to disk first (full:
+  250 MB, p50: 150 MB), warm or cold, on every invocation.
+- **`tail+since` still wins, by a smaller margin.** At p99: 5.9 MB / 0.04 s
+  vs 19.9 MB / 0.14 s for plain `--since` (~3x). The margin is the active
+  file size, so it grows with `max-size`.
+
+### Configuration D: json-file, same rotation, compression off (control)
+
+- driver `json-file` with `max-size=50m`, `max-file=10`, `compress=false`
+  (daemon.json equivalent: `"log-driver": "json-file", "log-opts":
+  {"max-size": "50m", "max-file": "10", "compress": "false"}`)
+- 270 MB on disk: 5 plain 50 MB rotated files plus a ~20 MB active file
+
+To replicate:
+
+```sh
+uv run bench.py run --cache warm --configs json-uncompressed
+uv run bench.py run --cache cold --configs json-uncompressed
+```
+
+| scenario | lines out | rchar_MB | cold read_MB | cpu_s | wall_s |
+|---|---|---|---|---|---|
+| full | 1,000,000 | 269.9 | 270.0 | 3.22 | 2.06 |
+| since@p50 | 500,000 | 269.9 | 270.1 | 2.44 | 1.77 |
+| since@p90 | 100,000 | 269.9 | 270.0 | 1.82 | 1.51 |
+| since@p99 | 10,000 | 269.9 | 270.1 | 1.65 | 1.45 |
+| tail@p50 (N=550k) | 550,000 | 296.9 | 148.6 | 1.90 | 1.24 |
+| tail@p90 (N=110k) | 110,001 | 59.4 | 29.8 | 0.42 | 0.32 |
+| tail@p99 (N=11k) | 11,000 | 5.9 | 3.1 | 0.04 | 0.05 |
+| tail_since@p50 | 500,000 | 296.9 | 148.6 | 1.91 | 1.34 |
+| tail_since@p90 | 100,000 | 59.4 | 29.8 | 0.36 | 0.25 |
+| tail_since@p99 | 10,000 | 5.9 | 3.1 | 0.04 | 0.05 |
+
+#### Findings (control)
+
+Statistically identical to Configuration A in every cell: `--since` scans
+all 270 MB at every cutoff, `--tail` double-reads its window, and no
+writes occur on reads. Together with A's single-vs-rotated comparison this
+pins the causality: file count and file size do not matter to the reader;
+`compress=true` is the one option that changes `--since` behavior.
 
 ## Caveats
 

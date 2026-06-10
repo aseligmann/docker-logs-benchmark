@@ -389,7 +389,24 @@ def config_log_opts(config: str, args) -> list[str]:
             "--log-opt", f"max-file={args.local_max_file}",
             "--log-opt", "compress=true",
         ]
-    raise SystemExit(f"unknown config {config!r} (expected single, rotated, local)")
+    if config == "json-compressed":
+        return [
+            "--log-driver", "json-file",
+            "--log-opt", f"max-size={args.jsonc_max_size}",
+            "--log-opt", f"max-file={args.jsonc_max_file}",
+            "--log-opt", "compress=true",
+        ]
+    if config == "json-uncompressed":
+        return [
+            "--log-driver", "json-file",
+            "--log-opt", f"max-size={args.jsonc_max_size}",
+            "--log-opt", f"max-file={args.jsonc_max_file}",
+            "--log-opt", "compress=false",
+        ]
+    raise SystemExit(
+        f"unknown config {config!r} "
+        "(expected single, rotated, local, json-compressed, json-uncompressed)"
+    )
 
 
 def do_setup(args, sampler: Sampler) -> dict:
@@ -843,6 +860,8 @@ def add_config_opts(
     p.add_argument("--single-max-size", default="1g")
     p.add_argument("--local-max-size", default="50m")
     p.add_argument("--local-max-file", type=int, default=10)
+    p.add_argument("--jsonc-max-size", default="50m")
+    p.add_argument("--jsonc-max-file", type=int, default=10)
 
 
 def add_common(p: argparse.ArgumentParser, lines: int, out: str) -> None:
